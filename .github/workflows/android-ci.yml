@@ -27,10 +27,11 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
         shell: bash
-      - name: Build Android test app
-        uses: gradle/gradle-build-action@v2
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@ac638b010cf58a27ee6c972d7336334ccaf61c96
         with:
           gradle-version: wrapper
-          arguments: -PnewArchEnabled=${{matrix.newArchEnabled}} --no-daemon clean build check test
-          build-root-directory: example/android
+      - name: Build and Test Android App
+        working-directory: example/android
+        run: ./gradlew -PnewArchEnabled=${{matrix.newArchEnabled}} --no-daemon clean build check test
     timeout-minutes: 60

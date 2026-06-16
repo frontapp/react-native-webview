@@ -87,11 +87,14 @@ NSString *const CUSTOM_SELECTOR = @"_CUSTOM_SELECTOR_";
       }
   }
 
-  if (!self.menuItems) {
-      return [super canPerformAction:action withSender:sender];
-  }
-
-  return NO;
+  // Front patch (PB-68890): make `menuItems` additive instead of replacing
+  // the system menu. Defer everything to `[super canPerformAction:…]` so the
+  // standard items (Cut/Copy/Paste/Replace…/iOS-auto Open Link) keep working.
+  // Custom items must NOT short-circuit to YES here — RNCWKWebView has no
+  // implementation for `_CUSTOM_SELECTOR_*`; the dispatch needs to walk up the
+  // responder chain to RNCWebViewImpl, whose `methodSignatureForSelector:` /
+  // `forwardInvocation:` route the call to `tappedMenuItem:`.
+  return [super canPerformAction:action withSender:sender];
 }
 - (void)buildMenuWithBuilder:(id<UIMenuBuilder>)builder API_AVAILABLE(ios(13.0))  {
     if (@available(iOS 16.0, *)) {
@@ -100,6 +103,31 @@ NSString *const CUSTOM_SELECTOR = @"_CUSTOM_SELECTOR_";
       }
     }
     [super buildMenuWithBuilder:builder];
+    // Front patch (PB-68890): inject our custom menuItems into the iOS text-selection
+    // menu (UIEditMenuInteraction on iOS 16+). Without this, custom items only show
+    // when our explicit long-press handler presents the menu, not when iOS auto-shows
+    // it after a tap-drag/double-tap selection.
+    if (@available(iOS 16.0, *)) {
+      if (self.menuItems.count > 0) {
+        NSMutableArray<UICommand *> *commands = [NSMutableArray new];
+        for (NSDictionary *menuItem in self.menuItems) {
+          NSString *menuItemLabel = [RCTConvert NSString:menuItem[@"label"]];
+          NSString *menuItemKey = [RCTConvert NSString:menuItem[@"key"]];
+          NSString *sel = [NSString stringWithFormat:@"%@%@", CUSTOM_SELECTOR, menuItemKey];
+          UICommand *command = [UICommand commandWithTitle:menuItemLabel
+                                                     image:nil
+                                                    action:NSSelectorFromString(sel)
+                                              propertyList:nil];
+          [commands addObject:command];
+        }
+        UIMenu *customMenu = [UIMenu menuWithTitle:@""
+                                             image:nil
+                                        identifier:@"RNCWebViewCustomMenu"
+                                           options:UIMenuOptionsDisplayInline
+                                          children:commands];
+        [builder insertChildMenu:customMenu atEndOfMenuForIdentifier:UIMenuRoot];
+      }
+    }
 }
 #else // TARGET_OS_OSX
 - (void)scrollWheel:(NSEvent *)theEvent {
@@ -290,9 +318,56 @@ RCTAutoInsetsProtocol>
     }
 }
 
+// Front patch (PB-68842): returns YES when a menu element is iOS's auto-injected
+// "Open Link" action. In a WKWebView contenteditable, that action opens a URL built
+// from selection-adjacent text instead of the <a href>, producing a corrupted URL
+// (e.g. "https://example.com/path%0Anext-line-text"). We strip it and rely on Front's
+// own "Open Link" item (added via the menuItems prop) which uses the real href.
+// Matched by identifier (normalized: lowercased, non-alphanumerics removed) so it stays
+// robust across iOS releases — covers "WKMenuItemIdentifierOpenLink" and "com.apple.…open-link".
+static BOOL FrontIsSystemOpenLinkElement(UIMenuElement *element) API_AVAILABLE(ios(16.0)) {
+  NSString *identifier = nil;
+  if ([element isKindOfClass:[UIAction class]]) {
+    identifier = ((UIAction *)element).identifier;
+  } else if ([element isKindOfClass:[UICommand class]]) {
+    identifier = NSStringFromSelector(((UICommand *)element).action);
+  } else if ([element isKindOfClass:[UIMenu class]]) {
+    identifier = ((UIMenu *)element).identifier;
+  }
+  if (identifier.length == 0) {
+    return NO;
+  }
+  NSCharacterSet *nonAlphanumeric = [[NSCharacterSet alphanumericCharacterSet] invertedSet];
+  NSString *normalized = [[[identifier lowercaseString] componentsSeparatedByCharactersInSet:nonAlphanumeric] componentsJoinedByString:@""];
+  return [normalized containsString:@"openlink"];
+}
+
+// Front patch (PB-68842): recursively drops iOS's auto-injected "Open Link" from the
+// suggested actions, rebuilding any nested UIMenu with its filtered children so the rest
+// of the system menu (Cut/Copy/Paste/Replace…) is preserved unchanged.
+static NSArray<UIMenuElement *> * FrontFilterSystemOpenLink(NSArray<UIMenuElement *> *elements) API_AVAILABLE(ios(16.0)) {
+  NSMutableArray<UIMenuElement *> *filtered = [NSMutableArray new];
+  for (UIMenuElement *element in elements) {
+    if (FrontIsSystemOpenLinkElement(element)) {
+      continue;
+    }
+    if ([element isKindOfClass:[UIMenu class]]) {
+      UIMenu *menu = (UIMenu *)element;
+      NSArray<UIMenuElement *> *filteredChildren = FrontFilterSystemOpenLink(menu.children);
+      [filtered addObject:[menu menuByReplacingChildren:filteredChildren]];
+      continue;
+    }
+    [filtered addObject:element];
+  }
+  return filtered;
+}
+
 - (UIMenu *)editMenuInteraction:(UIEditMenuInteraction *)interaction menuForConfiguration:(UIEditMenuConfiguration *)configuration suggestedActions:(NSArray<UIMenuElement *> *)suggestedActions API_AVAILABLE(ios(16.0))
 {
-  NSMutableArray<UICommand *> *menuItems = [NSMutableArray new];
+  // Front patch (PB-68890): keep the iOS-suggested actions and append our
+  // custom UICommands so the menu is additive on iOS 16+.
+  // Front patch (PB-68842): first strip iOS's broken auto-injected "Open Link".
+  NSMutableArray<UIMenuElement *> *menuItems = [NSMutableArray arrayWithArray:FrontFilterSystemOpenLink(suggestedActions)];
   for(NSDictionary *menuItem in self.menuItems) {
     NSString *menuItemLabel = [RCTConvert NSString:menuItem[@"label"]];
     NSString *menuItemKey = [RCTConvert NSString:menuItem[@"key"]];
@@ -578,16 +653,18 @@ RCTAutoInsetsProtocol>
   }
 
 #if !TARGET_OS_OSX
-  // Allow this object to recognize gestures
-  if (self.menuItems != nil) {
-    UILongPressGestureRecognizer *longPress = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(startLongPress:)];
-    longPress.delegate = self;
+  // Front patch (PB-68890): always attach the long-press recognizer, not only
+  // when `menuItems` is non-nil at init time. We update `menuItems` dynamically
+  // (based on whether the selection is inside an anchor), so gating registration
+  // on the initial value means the recognizer never fires once the prop turns
+  // truthy. `startLongPress:` already early-returns when `self.menuItems` is nil.
+  UILongPressGestureRecognizer *longPress = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(startLongPress:)];
+  longPress.delegate = self;
 
-    longPress.minimumPressDuration = 0.4f;
-    longPress.numberOfTouchesRequired = 1;
-    longPress.cancelsTouchesInView = YES;
-    [self addGestureRecognizer:longPress];
-  }
+  longPress.minimumPressDuration = 0.4f;
+  longPress.numberOfTouchesRequired = 1;
+  longPress.cancelsTouchesInView = YES;
+  [self addGestureRecognizer:longPress];
 #endif // !TARGET_OS_OSX
 }
 
